@@ -2,6 +2,7 @@ import torch
 from torchvision.io import read_image, write_png
 import matplotlib.pyplot as plt
 import traceback
+from torchvision.datasets import CIFAR10
 
 
 def create_frequency_masks(size):
@@ -144,23 +145,24 @@ def main():
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+      # Load CIFAR-10 dataset
+    dataset = CIFAR10(root='./data', train=False, download=True, transform=ToTensor())
 
-    # Process image
-    image_path = 'my_image.jpg'
-    original = read_image(image_path).float() / 255.0
-    try:
-        # Separate frequencies and apply contrast sensitivity
-        result = process_image(image_path)
+  #Process and visualize a few images from the dataset
+    for i in range(5):  # Adjust the range for more or fewer images
+        original, label = dataset[i]
+        original = original.to(device)
 
-        # Save result
-        save_image(result, 'processed_image.png')
+        try:
+            print(f"Processing image {i} with label {label}")
+            result = process_image(original)
 
-        # Visualize original and result
-        visualize_images(original, result)
+            # Visualize original and processed images
+            visualize_images(original, result)
 
-    except Exception as e:
-        print(f"Error processing image: {e}")
-        traceback.print_exc()
+        except Exception as e:
+            print(f"Error processing image {i}: {e}")
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
