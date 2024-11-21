@@ -1,12 +1,74 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.datasets import CIFAR10
-from torchvision.transforms import ToTensor, Grayscale, GaussianBlur
+from torchvision.transforms import Compose, ToTensor, Grayscale, GaussianBlur
 import torchvision.transforms.functional as F
 import matplotlib.pyplot as plt
-import pandas as pd
 import time
 import random
+
+def main():
+    root = './data'
+
+    #Loads the CIFAR-10 dataset
+    cifar_dataset = CIFAR10(root=root, train=False, download=True,
+                            transform=Compose(
+                                [ToTensor(),
+                                 Grayscale(num_output_channels=1)]))
+
+    ages = [0, 6, 12]
+    batch_size = 1
+
+    #Creating loaders
+    for age in ages:
+        print(f"Visualizing transformations for age {age} months")
+        loaders = {
+            f"With Visual Acuity (Age {age})": DataLoader(
+                InfantVisionDataset(cifar_dataset, age_in_months=age, apply_acuity=True, apply_contrast=False),
+                batch_size=batch_size, shuffle=False
+            ),
+            f"With Spatial Frequency Contrast (Age {age})": DataLoader(
+                InfantVisionDataset(cifar_dataset, age_in_months=age, apply_acuity=False, apply_contrast=True),
+                batch_size=batch_size, shuffle=False
+            ),
+            f"With Both Transformations (Age {age})": DataLoader(
+                InfantVisionDataset(cifar_dataset, age_in_months=age, apply_acuity=True, apply_contrast=True),
+                batch_size=batch_size, shuffle=False
+            ),
+        }
+
+        #Visualize and evaluate performance for each loader
+        for name, loader in loaders.items():
+            print(f"Visualizing {name}")
+            visualize_transforms(loader, num_images=5)
+            time_taken = evaluate_performance(loader, name)
+            print(f"Time taken: {time_taken:.2f} seconds")
+
+class InfantVisionDataset(Dataset):
+    def __init__(self, dataset, age_in_months=0, apply_acuity=False, apply_contrast=False):
+        self.dataset = dataset
+        self.age_in_months = age_in_months
+        self.apply_acuity = apply_acuity
+        self.apply_contrast = apply_contrast
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        image, label = self.dataset[idx]
+
+        processed_image = image
+
+        if self.apply_acuity:
+            processed_image = apply_visual_acuity(image, self.age_in_months)
+
+        if self.apply_contrast:
+            processed_image = apply_spatial_frequency_contrast(image, self.age_in_months)
+
+        return image, processed_image, label
+
+############################################################################################################
+# Visual Acuity
 
 def map_visual_acuity(age_months):
     """Map age in months to blur kernel size based on visual acuity (20/600 to 20/20)."""
@@ -15,6 +77,15 @@ def map_visual_acuity(age_months):
     acuity = min_acuity - (min_acuity - max_acuity) * (age_months / 12)
     kernel_size = max(3, int((acuity / min_acuity) * 11))  #Scales the kernel size, min 3
     return kernel_size
+
+def apply_visual_acuity(image, age_months):
+    """Apply visual acuity (blurring) based on age in months."""
+    kernel_size = map_visual_acuity(age_months)
+    blurred_image = GaussianBlur(kernel_size)(image)
+    return blurred_image
+
+############################################################################################################
+# Contrast
 
 def create_frequency_masks(size):
     """Create frequency band masks using PyTorch."""
@@ -57,45 +128,27 @@ def separate_frequencies(image):
 
     return bands
 
-def apply_visual_acuity(image, age_months):
-    """Apply visual acuity (blurring) based on age in months."""
-    kernel_size = map_visual_acuity(age_months)
-    blurred_image = GaussianBlur(kernel_size)(image)
-    return blurred_image
+def adjust_contrast(image, factor):
+    """Adjust contrast of an image using PyTorch"""
+    mean = torch.mean(image)
+    return (image - mean) * factor + mean
 
-def apply_spatial_frequency_contrast(image, sensitivity_factors):
+def get_sensitivity_factors(age_months):
+    """Get sensitivity factors for different frequency bands."""
+    return [1, 1, 1]
+
+def apply_spatial_frequency_contrast(image, age_months):
+    sensitivity_factors = get_sensitivity_factors(age_months)
+
     """Apply contrast sensitivity to different frequency bands."""
     frequency_bands = separate_frequencies(image)
     transformed_bands = [
-        F.adjust_contrast(band.unsqueeze(0), factor).squeeze(0)
+        adjust_contrast(band.unsqueeze(0), factor).squeeze(0)
         for band, factor in zip(frequency_bands, sensitivity_factors)
     ]
     return torch.sum(torch.stack(transformed_bands), dim=0)
 
-class InfantVisionDataset(Dataset):
-    def __init__(self, dataset, age_in_months=0, sensitivity_factors=(1.5, 0.8, 2), apply_acuity=False, apply_contrast=False):
-        self.dataset = dataset
-        self.age_in_months = age_in_months
-        self.sensitivity_factors = sensitivity_factors
-        self.apply_acuity = apply_acuity
-        self.apply_contrast = apply_contrast
-        #self.grayscale = Grayscale()  #Converts to grayscale
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        image, label = self.dataset[idx]
-        #image = self.grayscale(image)  #Converts to grayscale
-        processed_image = image
-
-        if self.apply_acuity:
-            processed_image = apply_visual_acuity(processed_image, self.age_in_months)
-
-        if self.apply_contrast:
-            processed_image = apply_spatial_frequency_contrast(processed_image, self.sensitivity_factors)
-
-        return image, processed_image, label
+############################################################################################################
 
 def evaluate_performance(loader, name="Dataset"):
     """Measure the performance of data loading."""
@@ -118,50 +171,16 @@ def visualize_transforms(loader, num_images=5):
         
         #Displays original image
         plt.subplot(2, num_images, i + 1)
-        plt.imshow(original.permute(1, 2, 0))
+        plt.imshow(original.permute(1, 2, 0), cmap='gray')
         plt.title("Original")
         plt.axis('off')
 
         #Displays transformed image
         plt.subplot(2, num_images, i + 1 + num_images)
-        plt.imshow(transformed.permute(1, 2, 0))
+        plt.imshow(transformed.permute(1, 2, 0), cmap='gray')
         plt.title("Transformed")
         plt.axis('off')
     plt.show()
-
-def main():
-    root = './data'
-
-    #Loads the CIFAR-10 dataset
-    cifar_dataset = CIFAR10(root=root, train=False, download=True, transform=ToTensor())
-
-    #Ages in months to visualize
-    ages = [0, 6, 12]
-
-    #Creating loaders
-    for age in ages:
-        print(f"Visualizing transformations for age {age} months")
-        loaders = {
-            f"With Visual Acuity (Age {age})": DataLoader(
-                InfantVisionDataset(cifar_dataset, age_in_months=age, apply_acuity=True, apply_contrast=False),
-                batch_size=100, shuffle=False
-            ),
-            f"With Spatial Frequency Contrast (Age {age})": DataLoader(
-                InfantVisionDataset(cifar_dataset, age_in_months=age, sensitivity_factors=(1.5, 0.8, 2), apply_acuity=False, apply_contrast=True),
-                batch_size=100, shuffle=False
-            ),
-            f"With Both Transformations (Age {age})": DataLoader(
-                InfantVisionDataset(cifar_dataset, age_in_months=age, sensitivity_factors=(1.5, 0.8, 2), apply_acuity=True, apply_contrast=True),
-                batch_size=100, shuffle=False
-            ),
-        }
-
-        #Visualize and evaluate performance for each loader
-        for name, loader in loaders.items():
-            print(f"Visualizing {name}")
-            visualize_transforms(loader, num_images=5)
-            time_taken = evaluate_performance(loader, name)
-            print(f"Time taken: {time_taken:.2f} seconds")
 
 if __name__ == "__main__":
     main()
