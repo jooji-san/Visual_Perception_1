@@ -1,5 +1,4 @@
 from math import tan, pi
-
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.datasets import CIFAR10
@@ -22,6 +21,14 @@ def main():
     ages = [1, 2, 3]
     batch_size = 100
 
+    #Store performance results
+    performance_results = []
+
+    #Add DataLoader for no transformations
+    no_transform_loader = DataLoader(cifar_dataset, batch_size=batch_size, shuffle=False)
+    time_taken = evaluate_performance(no_transform_loader, "Without Transformations")
+    performance_results.append({"Transformation": "Without Transformations", "Time (s)": time_taken})
+
     #Creating loaders
     for age in ages:
         print(f"Visualizing transformations for age {age} months")
@@ -40,7 +47,11 @@ def main():
         for name, loader in loaders.items():
             visualize_transforms(f"Visualizing {name}", loader, num_images=5)
             time_taken = evaluate_performance(loader, name)
+            performance_results.append({"Transformation": name, "Time (s)": time_taken})
             print(f"Time taken: {time_taken:.2f} seconds")
+
+    #Create the dot plot
+    plot_performance(performance_results)
 
 class InfantVisionDataset(Dataset):
     def __init__(self, dataset, age_in_months=0, apply_acuity=False, apply_contrast=False):
@@ -68,7 +79,7 @@ class InfantVisionDataset(Dataset):
         return image, processed_image, label
 
 ############################################################################################################
-# Visual Acuity
+#Visual Acuity
 
 def map_visual_acuity(age_months):
     """Map age in months to blur kernel size based on visual acuity (20/600 to 20/20)."""
@@ -87,15 +98,15 @@ def apply_visual_acuity(image, age_months):
     return blurred_image
 
 ############################################################################################################
-# Contrast
+#Contrast
 
 def cpd_to_normalized_freq(cpd, image_width_pixels, viewing_distance_mm, screen_width_mm):
     """Convert cycles per degree to normalized frequency."""
-    # Calculate pixels per degree
+    #Calculate pixels per degree
     ppd = (viewing_distance_mm * tan(1 * pi/180) * image_width_pixels) / screen_width_mm
-    # Convert cycles per degree to cycles per pixel
+    #Convert cycles per degree to cycles per pixel
     cpp = cpd / ppd
-    # Convert to normalized frequency (0 to 1)
+    #Convert to normalized frequency (0 to 1)
     return cpp * image_width_pixels
 
 
@@ -112,7 +123,7 @@ def create_vertical_frequency_masks(size, frequency_bounds):
 
     vertical_freq = torch.abs(x_grid - center_col) / (cols / 2)
 
-    # Convert frequency bounds to tensor if it's not already
+    #Convert frequency bounds to tensor if it's not already
     freq_bounds = torch.tensor(frequency_bounds, dtype=torch.float32)
 
     masks = []
@@ -182,20 +193,20 @@ def get_sensitivity_factors(image, age_months, center_frequencies):
     return factors
 
 def apply_spatial_frequency_contrast(device, image, age_months):
-    # Define frequency bounds (in normalized units)
+    #Define frequency bounds (in normalized units)
     max_cpd = 30.0
-    cpd_bounds = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30]  # in CPD
+    cpd_bounds = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30]  #in CPD
     frequency_bounds = torch.tensor([cpd / max_cpd for cpd in cpd_bounds], device=device)
 
-    # Calculate center frequency for each band
+    #Calculate center frequency for each band
     center_frequencies = [(frequency_bounds[i] + frequency_bounds[i + 1]) / 2
                           for i in range(len(frequency_bounds) - 1)]
 
-    # Get sensitivity factors
+    #Get sensitivity factors
     sensitivity_factors = get_sensitivity_factors(image, age_months, center_frequencies)
     sensitivity_factors = sensitivity_factors.to(device)
 
-    # Separate frequencies
+    #Separate frequencies
     vertical_frequency_bands = separate_vertical_frequencies(device, image, frequency_bounds.cpu().tolist())
 
     vertical_transformed_bands = [
@@ -215,6 +226,19 @@ def evaluate_performance(loader, name="Dataset"):
     elapsed_time = time.time() - start_time
     print(f"Time to load 100 images from {name}: {elapsed_time:.2f} seconds")
     return elapsed_time
+
+def plot_performance(performance_results):
+    """Plot the dot plot for performance times."""
+    plt.figure(figsize=(10, 5))
+    for result in performance_results:
+        plt.scatter(result["Transformation"], result["Time (s)"], s=100, color="blue")
+    plt.title("Performance Comparison")
+    plt.xlabel("Transformation Scenario")
+    plt.ylabel("Time (seconds)")
+    plt.xticks(rotation=45, ha="right")
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.tight_layout()
+    plt.show()
 
 def visualize_transforms(name, loader, num_images=5):
     """Visualize original and transformed images."""
@@ -243,6 +267,3 @@ def visualize_transforms(name, loader, num_images=5):
 
 if __name__ == "__main__":
     main()
-
-
-
