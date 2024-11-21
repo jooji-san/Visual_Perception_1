@@ -1,11 +1,14 @@
+from math import tan, pi
+
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.datasets import CIFAR10
 from torchvision.transforms import Compose, ToTensor, Grayscale, GaussianBlur
-import torchvision.transforms.functional as F
 import matplotlib.pyplot as plt
 import time
 import random
+import numpy as np
+from scipy.interpolate import interp1d
 
 def main():
     root = './data'
@@ -16,8 +19,8 @@ def main():
                                 [ToTensor(),
                                  Grayscale(num_output_channels=1)]))
 
-    ages = [0, 6, 12]
-    batch_size = 1
+    ages = [1, 2, 3]
+    batch_size = 100
 
     #Creating loaders
     for age in ages:
@@ -30,17 +33,12 @@ def main():
             f"With Spatial Frequency Contrast (Age {age})": DataLoader(
                 InfantVisionDataset(cifar_dataset, age_in_months=age, apply_acuity=False, apply_contrast=True),
                 batch_size=batch_size, shuffle=False
-            ),
-            f"With Both Transformations (Age {age})": DataLoader(
-                InfantVisionDataset(cifar_dataset, age_in_months=age, apply_acuity=True, apply_contrast=True),
-                batch_size=batch_size, shuffle=False
-            ),
+            )
         }
 
         #Visualize and evaluate performance for each loader
         for name, loader in loaders.items():
-            print(f"Visualizing {name}")
-            visualize_transforms(loader, num_images=5)
+            visualize_transforms(f"Visualizing {name}", loader, num_images=5)
             time_taken = evaluate_performance(loader, name)
             print(f"Time taken: {time_taken:.2f} seconds")
 
@@ -50,6 +48,8 @@ class InfantVisionDataset(Dataset):
         self.age_in_months = age_in_months
         self.apply_acuity = apply_acuity
         self.apply_contrast = apply_contrast
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 
     def __len__(self):
         return len(self.dataset)
@@ -63,7 +63,7 @@ class InfantVisionDataset(Dataset):
             processed_image = apply_visual_acuity(image, self.age_in_months)
 
         if self.apply_contrast:
-            processed_image = apply_spatial_frequency_contrast(image, self.age_in_months)
+            processed_image = apply_spatial_frequency_contrast(self.device, image, self.age_in_months)
 
         return image, processed_image, label
 
@@ -81,14 +81,26 @@ def map_visual_acuity(age_months):
 def apply_visual_acuity(image, age_months):
     """Apply visual acuity (blurring) based on age in months."""
     kernel_size = map_visual_acuity(age_months)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
     blurred_image = GaussianBlur(kernel_size)(image)
     return blurred_image
 
 ############################################################################################################
 # Contrast
 
-def create_frequency_masks(size):
-    """Create frequency band masks using PyTorch."""
+def cpd_to_normalized_freq(cpd, image_width_pixels, viewing_distance_mm, screen_width_mm):
+    """Convert cycles per degree to normalized frequency."""
+    # Calculate pixels per degree
+    ppd = (viewing_distance_mm * tan(1 * pi/180) * image_width_pixels) / screen_width_mm
+    # Convert cycles per degree to cycles per pixel
+    cpp = cpd / ppd
+    # Convert to normalized frequency (0 to 1)
+    return cpp * image_width_pixels
+
+
+def create_vertical_frequency_masks(size, frequency_bounds):
+    """Create vertical frequency band masks using PyTorch."""
     rows, cols = size
     center_row, center_col = rows // 2, cols // 2
 
@@ -98,27 +110,27 @@ def create_frequency_masks(size):
         indexing='ij'
     )
 
-    #Formula for distance from center
-    distance = torch.sqrt(
-        (y_grid - center_row) ** 2 + (x_grid - center_col) ** 2
-    ) / (min(rows, cols) / 2)
+    vertical_freq = torch.abs(x_grid - center_col) / (cols / 2)
 
-    #Frequency bands
-    low_mask = (distance <= 0.2).float()
-    mid_mask = ((distance > 0.2) & (distance <= 0.5)).float()
-    high_mask = (distance > 0.5).float()
+    # Convert frequency bounds to tensor if it's not already
+    freq_bounds = torch.tensor(frequency_bounds, dtype=torch.float32)
 
-    return [low_mask, mid_mask, high_mask]
+    masks = []
+    for i in range(len(freq_bounds) - 1):
+        mask = ((vertical_freq > freq_bounds[i]) &
+                (vertical_freq <= freq_bounds[i + 1])).float()
+        masks.append(mask)
 
-def separate_frequencies(image):
+    return masks
+
+def separate_vertical_frequencies(device, image, frequency_bounds):
     """Separate image into different frequency bands using FFT."""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     image = image.to(device)
 
     fft = torch.fft.fft2(image.float())
     fft_shift = torch.fft.fftshift(fft)
 
-    masks = [mask.to(device) for mask in create_frequency_masks(image.shape[-2:])]
+    masks = [mask.to(device) for mask in create_vertical_frequency_masks(image.shape[-2:], frequency_bounds)]
     bands = []
     for mask in masks:
         filtered = fft_shift * mask
@@ -133,20 +145,64 @@ def adjust_contrast(image, factor):
     mean = torch.mean(image)
     return (image - mean) * factor + mean
 
-def get_sensitivity_factors(age_months):
-    """Get sensitivity factors for different frequency bands."""
-    return [1, 1, 1]
+def interpolate_sensitivity(known_sensitivities, known_frequencies, target_frequencies):
+    known_freq = np.array(known_frequencies)
+    known_sens = np.array(known_sensitivities)
 
-def apply_spatial_frequency_contrast(image, age_months):
-    sensitivity_factors = get_sensitivity_factors(age_months)
+    interpolator = interp1d(known_freq, known_sens,
+                            kind='linear',
+                            fill_value=(known_sens[0], known_sens[-1]),
+                            bounds_error=False)
 
-    """Apply contrast sensitivity to different frequency bands."""
-    frequency_bands = separate_frequencies(image)
-    transformed_bands = [
+    return torch.from_numpy(interpolator(target_frequencies)).float()
+
+def get_sensitivity_factors(image, age_months, center_frequencies):
+    """
+    Get sensitivity factors for different frequency bands.
+    """
+    known_frequencies_cpd = [0.2, 0.3, 0.5, 1, 2]
+    max_cpd = 30.0
+    known_frequencies_norm = [cpd/max_cpd for cpd in known_frequencies_cpd]
+
+    if age_months == 1:
+        known_sensitivities = [7, 7, 8, 3, 2]
+    elif age_months == 2:
+        known_sensitivities = [5, 11, 10, 3, 3]
+    else:
+        known_sensitivities = [7, 11, 17, 10, 5]
+
+    adult_sensitivities = [120, 190, 350, 380, 800]
+
+    relative_sensitivity = [s1/s2 for s1, s2 in zip(known_sensitivities, adult_sensitivities)]
+
+    factors = interpolate_sensitivity(relative_sensitivity,
+                                      known_frequencies_norm,
+                                      center_frequencies)
+
+    return factors
+
+def apply_spatial_frequency_contrast(device, image, age_months):
+    # Define frequency bounds (in normalized units)
+    max_cpd = 30.0
+    cpd_bounds = [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30]  # in CPD
+    frequency_bounds = torch.tensor([cpd / max_cpd for cpd in cpd_bounds], device=device)
+
+    # Calculate center frequency for each band
+    center_frequencies = [(frequency_bounds[i] + frequency_bounds[i + 1]) / 2
+                          for i in range(len(frequency_bounds) - 1)]
+
+    # Get sensitivity factors
+    sensitivity_factors = get_sensitivity_factors(image, age_months, center_frequencies)
+    sensitivity_factors = sensitivity_factors.to(device)
+
+    # Separate frequencies
+    vertical_frequency_bands = separate_vertical_frequencies(device, image, frequency_bounds.cpu().tolist())
+
+    vertical_transformed_bands = [
         adjust_contrast(band.unsqueeze(0), factor).squeeze(0)
-        for band, factor in zip(frequency_bands, sensitivity_factors)
+        for band, factor in zip(vertical_frequency_bands, sensitivity_factors)
     ]
-    return torch.sum(torch.stack(transformed_bands), dim=0)
+    return torch.sum(torch.stack(vertical_transformed_bands), dim=0)
 
 ############################################################################################################
 
@@ -160,15 +216,18 @@ def evaluate_performance(loader, name="Dataset"):
     print(f"Time to load 100 images from {name}: {elapsed_time:.2f} seconds")
     return elapsed_time
 
-def visualize_transforms(loader, num_images=5):
+def visualize_transforms(name, loader, num_images=5):
     """Visualize original and transformed images."""
     #Randomly select indices
+
     indices = random.sample(range(len(loader.dataset)), num_images)
     
     plt.figure(figsize=(10, 4))
     for i, idx in enumerate(indices):
+        plt.suptitle(name, fontsize=16)
+
         original, transformed, _ = loader.dataset[idx]
-        
+
         #Displays original image
         plt.subplot(2, num_images, i + 1)
         plt.imshow(original.permute(1, 2, 0), cmap='gray')
