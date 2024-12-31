@@ -1,17 +1,19 @@
 import os
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.models as models
-from torch.utils.data import DataLoader, random_split
-from dataLoader import VisualAcuityDataset, VisualContrastDataset
-from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from dataLoader import DatasetWithTransformationByAge, TransformationType, SplitType
 
 # Define the model
 class CustomResNet18(nn.Module):
-    def __init__(self, num_classes=10):
+    def __init__(self, num_classes):
         super(CustomResNet18, self).__init__()
-        self.model = models.resnet18(pretrained=True)
+        self.model = models.resnet18(pretrained=False)
         self.model.fc = nn.Linear(self.model.fc.in_features, num_classes)
 
     def forward(self, x):
@@ -27,8 +29,8 @@ def train_network(model, train_dataloader, val_dataloader, criterion, optimizer,
         total_train_loss = 0.0
 
         # Training loop
-        for images, labels in train_dataloader:
-            images, labels = images.permute(0, 3, 1, 2).to(device), labels.to(device)
+        for images, labels in tqdm(train_dataloader):
+            images, labels = images.to(device), labels.to(device)
 
             optimizer.zero_grad()
             outputs = model(images)
@@ -47,7 +49,7 @@ def train_network(model, train_dataloader, val_dataloader, criterion, optimizer,
         total_val_loss = 0.0
         with torch.no_grad():
             for images, labels in val_dataloader:
-                images, labels = images.permute(0, 3, 1, 2).to(device), labels.to(device)
+                images, labels = images.to(device), labels.to(device)
                 outputs = model(images)
                 loss = criterion(outputs, labels)
                 total_val_loss += loss.item()
@@ -63,45 +65,70 @@ def train_network(model, train_dataloader, val_dataloader, criterion, optimizer,
 # Main script
 if __name__ == "__main__":
     # Configuration
-    image_directory = './tiny-imagenet-200'
     batch_size = 32
     num_epochs = 10
     learning_rate = 0.001
+
+    num_classes = 10
 
     # Device setup
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Initialize model, criterion, and optimizer
-    model = CustomResNet18(num_classes=200).to(device)  # TinyImageNet has 200 classes
+    model = CustomResNet18(num_classes=num_classes).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-    # Data augmentation and transformations
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    # my pc
+    #dataset_path = os.path.join(os.path.expanduser("~"), "Downloads", "tiny-imagenet-200")
+    # cip-pool
+    dataset_path = os.path.join("./tiny-imagenet-200")
 
-    # Load TinyImageNet dataset
-    train_dataset = datasets.ImageFolder(os.path.join(image_directory, 'train'), transform=transform)
-    train_size = int(0.8 * len(train_dataset))
-    val_size = len(train_dataset) - train_size
-    train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
+    transformationTypes = [None, TransformationType.CONTRAST, TransformationType.ACUITY, TransformationType.CONTRAST | TransformationType.ACUITY]
+    for transformIndex, transformType  in enumerate(transformationTypes):
+        train_dataset_list = []
+        val_dataset_list = []
+        for age_group in range(3)   :
+            train_dataset_age_group_list = []
+            val_dataset_age_group_list = []
+            for i in range(1, 4):
+                train_dataset_age_group_list.append(DatasetWithTransformationByAge(dataset_path, SplitType.TRAIN, age_group * 5 + i, transformType))
+                val_dataset_age_group_list.append(DatasetWithTransformationByAge(dataset_path, SplitType.VAL, age_group * 5  + i, transformType))
 
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+            # randomize in the group
+            train_dataset_age_group = torch.utils.data.ConcatDataset(train_dataset_age_group_list)
+            indices = torch.randperm(len(train_dataset_age_group)).tolist()
+            shuffled_train_dataset_dataset = torch.utils.data.Subset(train_dataset_age_group, indices)
 
-    # Train the network
-    train_losses, val_losses = train_network(model, train_dataloader, val_dataloader, criterion, optimizer, num_epochs)
+            train_dataset_list.append(shuffled_train_dataset_dataset)
 
-    # Save the trained model
-    os.makedirs('./networks', exist_ok=True)
-    torch.save(model.state_dict(), './networks/model_tinyimagenet.pth')
+            val_dataset_age_group = torch.utils.data.ConcatDataset(val_dataset_age_group_list)
+            indices = torch.randperm(len(val_dataset_age_group)).tolist()
+            shuffled_val_dataset_dataset = torch.utils.data.Subset(val_dataset_age_group, indices)
 
-    # Save loss data for later analysis
-    with open("training_validation_loss.json", "w") as f:
-        import json
-        json.dump({"train_losses": train_losses, "val_losses": val_losses}, f)
+            val_dataset_list.append(shuffled_val_dataset_dataset)
 
-    print("Training complete. Model and loss data saved!")
+        train_dataset = torch.utils.data.ConcatDataset(train_dataset_list)
+        val_dataset = torch.utils.data.ConcatDataset(val_dataset_list)
+
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_size)
+        val_dataloader = DataLoader(val_dataset, batch_size=batch_size)
+
+        # Train the network
+        train_losses, val_losses = train_network(model, train_dataloader, val_dataloader, criterion, optimizer, num_epochs)
+
+        # Save the trained model
+        os.makedirs('./networks', exist_ok=True)
+        torch.save(model.state_dict(), f'./networks/model_tinyimagenet_{str(transformType)}.pth')
+        torch.save(model.state_dict(), f'./networks/model_tinyimagenet_{transformIndex}.pth')
+
+        # Save loss data for later analysis
+        with open(f'training_validation_loss_{str(transformType)}.json', "w") as f:
+            import json
+            json.dump({"train_losses": train_losses, "val_losses": val_losses}, f)
+
+        with open(f'training_validation_loss_{transformIndex}.json', "w") as f:
+            import json
+            json.dump({"train_losses": train_losses, "val_losses": val_losses}, f)
+
+        print("Training complete. Model and loss data saved!")
